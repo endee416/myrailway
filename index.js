@@ -3,9 +3,9 @@ const express = require("express");
 const axios = require("axios");
 
 const app = express();
-app.use(express.json()); // Parse JSON bodies
+app.use(express.json()); // parse JSON bodies
 
-// POST endpoint to handle payout in one go
+// POST /payout
 app.post("/payout", async (req, res) => {
   try {
     // 1) Validate input
@@ -36,15 +36,37 @@ app.post("/payout", async (req, res) => {
         },
       }
     );
-    const resolvedAccountName = resolveRes.data?.data?.account_name;
-    if (!resolvedAccountName || resolvedAccountName.toLowerCase() !== vendorName.toLowerCase()) {
+    const resolvedAccountName = resolveRes.data?.data?.account_name; // e.g. "NNAMDI GOODNESS ANEKE"
+
+    // Partial name match check
+    if (!resolvedAccountName) {
+      return res.status(400).json({
+        success: false,
+        error: "Account verification failed: Paystack returned no name",
+      });
+    }
+
+    // Lowercase both
+    const resolvedLower = resolvedAccountName.toLowerCase();
+    const userLower = vendorName.toLowerCase();
+
+    // Split user name into words, ensure each word is in resolved name
+    const userWords = userLower.split(" ").filter(Boolean); // e.g. ["nnamdi", "aneke"]
+    let mismatch = false;
+    for (const word of userWords) {
+      if (!resolvedLower.includes(word)) {
+        mismatch = true;
+        break;
+      }
+    }
+    if (mismatch) {
       return res.status(400).json({
         success: false,
         error: "Account verification failed: name mismatch or invalid details",
       });
     }
 
-    // 4) Create a transfer recipient
+    // 4) Create transfer recipient
     const recipientResponse = await axios.post(
       "https://api.paystack.co/transferrecipient",
       {
@@ -69,12 +91,12 @@ app.post("/payout", async (req, res) => {
       });
     }
 
-    // 5) Initiate the transfer (convert amount to kobo)
+    // 5) Initiate transfer
     const transferResponse = await axios.post(
       "https://api.paystack.co/transfer",
       {
         source: "balance",
-        amount: Number(amount) * 100,
+        amount: Number(amount) * 100, // convert to kobo
         recipient: recipientCode,
         reason: "Vendor Payout",
       },
@@ -86,7 +108,7 @@ app.post("/payout", async (req, res) => {
       }
     );
 
-    // 6) Return success
+    // Return success
     return res.status(200).json({
       success: true,
       data: transferResponse.data?.data,
@@ -94,8 +116,6 @@ app.post("/payout", async (req, res) => {
     });
   } catch (error) {
     console.error("Payout error:", error.response?.data || error.message);
-
-    // If Paystack or any step fails, respond with error
     return res.status(500).json({
       success: false,
       error: error.response?.data?.message || error.message || "Payout failed",
@@ -103,7 +123,7 @@ app.post("/payout", async (req, res) => {
   }
 });
 
-// Listen on the port provided by Railway or default to 3000
+// Listen on the port provided by hosting or 3000
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
