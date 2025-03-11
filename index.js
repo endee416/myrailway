@@ -61,7 +61,6 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
     }
 
     // --- Check and update user's balance in Firestore ---
-    // Query for a document where the "uid" field equals vendorId.
     console.log("Querying Firestore for user with uid:", vendorId);
     const usersQuerySnapshot = await firestore
       .collection("users")
@@ -101,24 +100,40 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
 
     // Resolve the account using Paystack's API
     console.log(`Resolving account number ${account_number} with bank code ${bank_code}`);
-    const resolveRes = await axios.get(
-      `https://api.paystack.co/bank/resolve?account_number=${account_number}&bank_code=${bank_code}`,
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
+    let resolvedAccountName;
+    try {
+      const resolveRes = await axios.get(
+        `https://api.paystack.co/bank/resolve?account_number=${account_number}&bank_code=${bank_code}`,
+        {
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      resolvedAccountName = resolveRes.data?.data?.account_name;
+      console.log("Resolved account name from Paystack:", resolvedAccountName);
+    } catch (resolveError) {
+      console.error("Account resolution error from Paystack:", resolveError.response?.data || resolveError.message);
+      // Refund the reserved funds if account resolution fails
+      try {
+        await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
+        console.log("Refunded funds due to account resolution error.");
+      } catch (refundError) {
+        console.error("Refund update failed after account resolution error:", refundError);
       }
-    );
-    const resolvedAccountName = resolveRes.data?.data?.account_name;
-    console.log("Resolved account name from Paystack:", resolvedAccountName);
+      return res.status(400).json({
+        success: false,
+        error: resolveError.response?.data?.message || "Could not resolve account name. Check parameters or try again.",
+      });
+    }
     if (!resolvedAccountName) {
       console.error("Account resolution failed: No account name returned.");
       try {
         await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
-        console.log("Refunded funds due to account resolution failure.");
+        console.log("Refunded funds due to no account name returned.");
       } catch (refundError) {
-        console.error("Refund update failed after account resolution failure:", refundError);
+        console.error("Refund update failed after no account name returned:", refundError);
       }
       return res.status(400).json({
         success: false,
@@ -153,31 +168,46 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
 
     // Create a transfer recipient on Paystack
     console.log("Creating transfer recipient on Paystack for vendor:", vendorName);
-    const recipientResponse = await axios.post(
-      "https://api.paystack.co/transferrecipient",
-      {
-        type: "nuban",
-        name: vendorName,
-        account_number,
-        bank_code,
-        currency: "NGN",
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json",
+    let recipientCode;
+    try {
+      const recipientResponse = await axios.post(
+        "https://api.paystack.co/transferrecipient",
+        {
+          type: "nuban",
+          name: vendorName,
+          account_number,
+          bank_code,
+          currency: "NGN",
         },
-      }
-    );
-    const recipientCode = recipientResponse.data?.data?.recipient_code;
-    console.log("Recipient code from Paystack:", recipientCode);
-    if (!recipientCode) {
-      console.error("Failed to create transfer recipient.");
+        {
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      recipientCode = recipientResponse.data?.data?.recipient_code;
+      console.log("Recipient code from Paystack:", recipientCode);
+    } catch (recipientError) {
+      console.error("Error creating transfer recipient:", recipientError.response?.data || recipientError.message);
       try {
         await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
-        console.log("Refunded funds due to transfer recipient creation failure.");
+        console.log("Refunded funds due to transfer recipient creation error.");
       } catch (refundError) {
-        console.error("Refund update failed after transfer recipient creation failure:", refundError);
+        console.error("Refund update failed after transfer recipient creation error:", refundError);
+      }
+      return res.status(400).json({
+        success: false,
+        error: recipientError.response?.data?.message || "Failed to create transfer recipient",
+      });
+    }
+    if (!recipientCode) {
+      console.error("Failed to create transfer recipient: No recipient code returned.");
+      try {
+        await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
+        console.log("Refunded funds due to missing recipient code.");
+      } catch (refundError) {
+        console.error("Refund update failed after missing recipient code:", refundError);
       }
       return res.status(400).json({
         success: false,
