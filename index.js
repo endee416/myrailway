@@ -1,23 +1,55 @@
-// index.js
 const express = require("express");
 const axios = require("axios");
+const admin = require("firebase-admin");
 
 const app = express();
-app.use(express.json()); // parse JSON bodies
+app.use(express.json());
 
-// POST /payout
-app.post("/payout", async (req, res) => {
+// Initialize Firebase Admin using the service account JSON stored in one environment variable
+if (!admin.apps.length) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
+
+// Middleware to verify Firebase ID token from the Authorization header
+const verifyFirebaseToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res
+      .status(401)
+      .json({ success: false, error: "Unauthorized: No token provided" });
+  }
+  const idToken = authHeader.split("Bearer ")[1];
   try {
-    // 1) Validate input
-    const { amount, account_number, bank_code, vendorName, vendorId } = req.body;
-    if (!amount || !account_number || !bank_code || !vendorName || !vendorId) {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.user = decodedToken; // Attach decoded token (which includes uid) to the request
+    next();
+  } catch (error) {
+    console.error("Token verification failed:", error);
+    return res
+      .status(401)
+      .json({ success: false, error: "Unauthorized: Token verification failed" });
+  }
+};
+
+// Payout endpoint, now protected by the verifyFirebaseToken middleware
+app.post("/payout", verifyFirebaseToken, async (req, res) => {
+  // The verified vendor's UID is available as req.user.uid
+  const vendorId = req.user.uid;
+
+  try {
+    // Validate required input fields
+    const { amount, account_number, bank_code, vendorName } = req.body;
+    if (!amount || !account_number || !bank_code || !vendorName) {
       return res.status(400).json({
         success: false,
         error: "Missing required fields",
       });
     }
 
-    // 2) Load Paystack secret key from environment variable
+    // Load Paystack secret key from environment variables
     const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
     if (!PAYSTACK_SECRET_KEY) {
       return res.status(500).json({
@@ -26,7 +58,7 @@ app.post("/payout", async (req, res) => {
       });
     }
 
-    // 3) Resolve account
+    // Resolve the account using Paystack's API
     const resolveRes = await axios.get(
       `https://api.paystack.co/bank/resolve?account_number=${account_number}&bank_code=${bank_code}`,
       {
@@ -36,9 +68,7 @@ app.post("/payout", async (req, res) => {
         },
       }
     );
-    const resolvedAccountName = resolveRes.data?.data?.account_name; // e.g. "NNAMDI GOODNESS ANEKE"
-
-    // Partial name match check
+    const resolvedAccountName = resolveRes.data?.data?.account_name;
     if (!resolvedAccountName) {
       return res.status(400).json({
         success: false,
@@ -46,12 +76,10 @@ app.post("/payout", async (req, res) => {
       });
     }
 
-    // Lowercase both
+    // Partial name match: ensure each word in vendorName exists in the resolved account name
     const resolvedLower = resolvedAccountName.toLowerCase();
     const userLower = vendorName.toLowerCase();
-
-    // Split user name into words, ensure each word is in resolved name
-    const userWords = userLower.split(" ").filter(Boolean); // e.g. ["nnamdi", "aneke"]
+    const userWords = userLower.split(" ").filter(Boolean);
     let mismatch = false;
     for (const word of userWords) {
       if (!resolvedLower.includes(word)) {
@@ -66,7 +94,7 @@ app.post("/payout", async (req, res) => {
       });
     }
 
-    // 4) Create transfer recipient
+    // Create a transfer recipient on Paystack
     const recipientResponse = await axios.post(
       "https://api.paystack.co/transferrecipient",
       {
@@ -91,12 +119,12 @@ app.post("/payout", async (req, res) => {
       });
     }
 
-    // 5) Initiate transfer
+    // Initiate the transfer on Paystack
     const transferResponse = await axios.post(
       "https://api.paystack.co/transfer",
       {
         source: "balance",
-        amount: Number(amount) * 100, // convert to kobo
+        amount: Number(amount) * 100, // convert amount from NGN to kobo
         recipient: recipientCode,
         reason: "Vendor Payout",
       },
@@ -108,7 +136,6 @@ app.post("/payout", async (req, res) => {
       }
     );
 
-    // Return success
     return res.status(200).json({
       success: true,
       data: transferResponse.data?.data,
@@ -118,12 +145,15 @@ app.post("/payout", async (req, res) => {
     console.error("Payout error:", error.response?.data || error.message);
     return res.status(500).json({
       success: false,
-      error: error.response?.data?.message || error.message || "Payout failed",
+      error:
+        error.response?.data?.message ||
+        error.message ||
+        "Payout failed",
     });
   }
 });
 
-// Listen on the port provided by hosting or 3000
+// Listen on the port provided by Railway or default to 3000
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
