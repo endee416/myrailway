@@ -61,15 +61,26 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
     }
 
     // --- NEW: Check and update user's balance in Firestore ---
-    const userRef = firestore.collection("users").doc(vendorId);
+    // Instead of assuming the document id is vendorId, query for a document where the "uid" field equals vendorId.
+    const usersQuerySnapshot = await firestore
+      .collection("users")
+      .where("uid", "==", vendorId)
+      .limit(1)
+      .get();
+    if (usersQuerySnapshot.empty) {
+      return res.status(400).json({ success: false, error: "User not found" });
+    }
+    const userDoc = usersQuerySnapshot.docs[0];
+    const userRef = userDoc.ref;
+
     let currentBalance;
     try {
       await firestore.runTransaction(async (transaction) => {
-        const userDoc = await transaction.get(userRef);
-        if (!userDoc.exists) {
+        const userDocSnapshot = await transaction.get(userRef);
+        if (!userDocSnapshot.exists) {
           throw new Error("User not found");
         }
-        currentBalance = Number(userDoc.data().balance);
+        currentBalance = Number(userDocSnapshot.data().balance);
         const withdrawalAmount = Number(amount);
         if (currentBalance < withdrawalAmount) {
           throw new Error("Insufficient balance");
