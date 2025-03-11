@@ -5,13 +5,15 @@ const admin = require("firebase-admin");
 const app = express();
 app.use(express.json());
 
-// Initialize Firebase Admin using the service account JSON stored in one environment variable
+// Initialize Firebase Admin using the service account JSON stored in a single environment variable
 if (!admin.apps.length) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 }
+
+const firestore = admin.firestore();
 
 // Middleware to verify Firebase ID token from the Authorization header
 const verifyFirebaseToken = async (req, res, next) => {
@@ -58,6 +60,28 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
       });
     }
 
+    // --- NEW: Check and update user's balance in Firestore ---
+    const userRef = firestore.collection("users").doc(vendorId);
+    let currentBalance;
+    try {
+      await firestore.runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
+        if (!userDoc.exists) {
+          throw new Error("User not found");
+        }
+        currentBalance = Number(userDoc.data().balance);
+        const withdrawalAmount = Number(amount);
+        if (currentBalance < withdrawalAmount) {
+          throw new Error("Insufficient balance");
+        }
+        // Deduct the withdrawal amount (reserve funds)
+        transaction.update(userRef, { balance: currentBalance - withdrawalAmount });
+      });
+    } catch (balanceError) {
+      return res.status(400).json({ success: false, error: balanceError.message });
+    }
+    // -----------------------------------------------------------
+
     // Resolve the account using Paystack's API
     const resolveRes = await axios.get(
       `https://api.paystack.co/bank/resolve?account_number=${account_number}&bank_code=${bank_code}`,
@@ -70,6 +94,8 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
     );
     const resolvedAccountName = resolveRes.data?.data?.account_name;
     if (!resolvedAccountName) {
+      // Refund the reserved funds if account resolution fails
+      await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
       return res.status(400).json({
         success: false,
         error: "Account verification failed: Paystack returned no name",
@@ -88,6 +114,8 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
       }
     }
     if (mismatch) {
+      // Refund the reserved funds if name verification fails
+      await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
       return res.status(400).json({
         success: false,
         error: "Account verification failed: name mismatch or invalid details",
@@ -113,6 +141,8 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
     );
     const recipientCode = recipientResponse.data?.data?.recipient_code;
     if (!recipientCode) {
+      // Refund the reserved funds if recipient creation fails
+      await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
       return res.status(400).json({
         success: false,
         error: "Failed to create transfer recipient",
@@ -120,25 +150,36 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
     }
 
     // Initiate the transfer on Paystack
-    const transferResponse = await axios.post(
-      "https://api.paystack.co/transfer",
-      {
-        source: "balance",
-        amount: Number(amount) * 100, // convert amount from NGN to kobo
-        recipient: recipientCode,
-        reason: "Vendor Payout",
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json",
+    let transferData;
+    try {
+      const transferResponse = await axios.post(
+        "https://api.paystack.co/transfer",
+        {
+          source: "balance",
+          amount: Number(amount) * 100, // convert amount from NGN to kobo
+          recipient: recipientCode,
+          reason: "Vendor Payout",
         },
-      }
-    );
+        {
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      transferData = transferResponse.data?.data;
+    } catch (transferError) {
+      // If payout fails, refund the reserved funds
+      await userRef.update({ balance: admin.firestore.FieldValue.increment(Number(amount)) });
+      return res.status(500).json({
+        success: false,
+        error: transferError.response?.data?.message || transferError.message || "Payout failed",
+      });
+    }
 
     return res.status(200).json({
       success: true,
-      data: transferResponse.data?.data,
+      data: transferData,
       message: "Payout successful!",
     });
   } catch (error) {
