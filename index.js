@@ -250,6 +250,13 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
       });
     }
 
+    // On successful transfer, add the withdrawal record to Firestore
+    await firestore.collection("withdrawals").add({
+      uid: vendorId,
+      amount: Number(amount),
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+
     return res.status(200).json({
       success: true,
       data: transferData,
