@@ -276,6 +276,122 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
 
 // Listen on the port provided by Railway or default to 3000
 const PORT = process.env.PORT || 3000;
+
+
+// ───── STAND-ALONE REFUND ENDPOINT ─────────────────────────────────────────
+
+
+app.post('/refund', async (req, res) => {
+  // 1) Extract and verify the Firebase ID token
+  const authHeader = req.headers.authorization || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'No token provided' });
+  }
+  const idToken = authHeader.split('Bearer ')[1];
+  let decoded;
+  try {
+    decoded = await admin.auth().verifyIdToken(idToken);
+  } catch (err) {
+    console.error('Token verification failed:', err);
+    return res.status(401).json({ success: false, error: 'Invalid token' });
+  }
+
+  // 2) Email‐only check
+  if (decoded.email !== 'rombek325@gmail.com') {
+    return res.status(403).json({ success: false, error: 'Forbidden' });
+  }
+
+  // 3) Validate request body
+  const { reference, useruid } = req.body;
+  if (!reference) {
+    return res.status(400).json({ success: false, error: 'Missing reference' });
+  }
+
+  // 4) Call Paystack refund
+  try {
+    const refundRes = await axios.post(
+      'https://api.paystack.co/refund',
+      { transaction: reference },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+    if (!refundRes.data.status) {
+      return res.status(400).json({
+        success: false,
+        error: refundRes.data.message || 'Refund failed on Paystack',
+      });
+    }
+  } catch (err) {
+    console.error('Paystack refund error:', err.response?.data || err.message);
+    return res.status(500).json({
+      success: false,
+      error: err.response?.data?.message || 'Error calling Paystack refund',
+    });
+  }
+
+  // 5) Batch-update Firestore orders + user counters
+  try {
+    const ordersSnap = await firestore
+      .collection('orders')
+      .where('reference', '==', reference)
+      .get();
+
+    if (!ordersSnap.empty) {
+      // gather distinct useruids
+      const uids = [ ...new Set(ordersSnap.docs.map(d => d.data().useruid)) ];
+      const usersSnap = await firestore
+        .collection('users')
+        .where('uid', 'in', uids)
+        .get();
+
+      await firestore.runTransaction(async tx => {
+        // mark each order refunded
+        ordersSnap.docs.forEach(docSnap => {
+          tx.update(docSnap.ref, {
+            status: 'refunded',
+            refundtime: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+
+        // decrement each user's counters
+        usersSnap.docs.forEach(userDoc => {
+          const data = userDoc.data();
+          const updates = {};
+          if ((data.totalorder || 0) > 0) {
+            updates.totalorder = admin.firestore.FieldValue.increment(-1);
+          }
+          if ((data.ordernumber || 0) > 0) {
+            updates.ordernumber = admin.firestore.FieldValue.increment(-1);
+          }
+          if (Object.keys(updates).length) {
+            tx.update(userDoc.ref, updates);
+          }
+        });
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Refund successful and Firestore updated.',
+    });
+  } catch (err) {
+    console.error('Firestore update error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Paystack succeeded but Firestore update failed',
+    });
+  }
+});
+// ────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
