@@ -112,6 +112,7 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
         }
       );
       resolvedAccountName = resolveRes.data?.data?.account_name;
+      const resolvedBankName = resolveRes.data?.data?.bank_name;
       console.log("Resolved account name from Paystack:", resolvedAccountName);
     } catch (resolveError) {
       console.error("Account resolution error from Paystack:", resolveError.response?.data || resolveError.message);
@@ -251,11 +252,14 @@ app.post("/payout", verifyFirebaseToken, async (req, res) => {
     }
 
     // On successful transfer, add the withdrawal record to Firestore
-    await firestore.collection("withdrawals").add({
-      uid: vendorId,
-      amount: Number(amount),
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
-    });
+  await firestore.collection("withdrawals").add({
+    uid: vendorId,
+    amount: Number(amount),
+    bankname: resolvedBankName,
+    accountno: account_number,
+    accountname: resolvedAccountName,
+    timestamp: admin.firestore.FieldValue.serverTimestamp()
+});
 
     return res.status(200).json({
       success: true,
